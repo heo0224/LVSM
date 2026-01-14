@@ -9,7 +9,6 @@ from einops import rearrange
 import imageio
 
 
-
 def create_video_from_frames(frames, output_video_file, framerate=30):
     """
     Creates a video from a sequence of frames.
@@ -26,7 +25,6 @@ def create_video_from_frames(frames, output_video_file, framerate=30):
         frames = (frames * 255).astype(np.uint8)
 
     imageio.mimsave(output_video_file, frames, fps=framerate, quality=8)
-
 
 
 class ProcessData(nn.Module):
@@ -50,7 +48,7 @@ class ProcessData(nn.Module):
         b, v = c2w.size()[:2]
         c2w = c2w.reshape(b * v, 4, 4)
 
-        fx, fy, cx, cy = fxfycxcy[:,:, 0], fxfycxcy[:,:,  1], fxfycxcy[:,:,  2], fxfycxcy[:,:,  3]
+        fx, fy, cx, cy = fxfycxcy[:, :, 0], fxfycxcy[:, :, 1], fxfycxcy[:, :, 2], fxfycxcy[:, :, 3]
         h_orig = int(2 * cy.max().item())  # Original height (estimated from the intrinsic matrix)
         w_orig = int(2 * cx.max().item())  # Original width (estimated from the intrinsic matrix)
         if h is None or w is None:
@@ -80,11 +78,11 @@ class ProcessData(nn.Module):
         ray_d = rearrange(ray_d, "(b v) (h w) c -> b v c h w", b=b, v=v, h=h, w=w, c=3)
 
         return ray_o, ray_d
-    
+
     def fetch_views(self, data_batch, has_target_image=False, target_has_input=True):
         """
         Splits the input data batch into input and target sets.
-        
+
         Args:
             data_batch (dict): Contains input tensors with the following keys:
                 - 'image' (torch.Tensor): Shape [b, v, c, h, w], optional for some target views
@@ -97,52 +95,74 @@ class ProcessData(nn.Module):
 
         """
         # randomize input views if dynamic_input_view_num is True and not in inference mode
-        if (self.config.training.get("dynamic_input_view_num", False) 
-            and (not self.config.inference.get("if_inference", False))):
+        if self.config.training.get("dynamic_input_view_num", False) and (
+            not self.config.inference.get("if_inference", False)
+        ):
             self.config.training.num_input_views = np.random.randint(2, 5)
-        
 
         input_dict, target_dict = {}, {}
         # index = [] save for future use if we want to select specific views
 
-        num_target_views, num_views, bs = self.config.training.num_target_views, data_batch["c2w"].size(1), data_batch["image"].size(0)
-        assert num_target_views < num_views, f"We have {num_views} views, but we want to select {num_target_views} target views. This is more than the total number of views we have."
-        
-        # Decide the target view indices
-        if target_has_input: 
-            # Randomly sample target views across all views
-            index = torch.tensor([
-                random.sample(range(num_views), num_target_views)
-                for _ in range(bs)
-            ], dtype=torch.long, device=data_batch["image"].device) # [b, num_target_views]
-        else:
-            assert (
-                self.config.training.num_input_views + num_target_views <= self.config.training.num_views
-            ), f"We have {self.config.training.num_views} views in total, but we want to select {self.config.training.num_input_views} input views and {num_target_views} target views. This is more than the total number of views we have."
-            
-            index = torch.tensor([
-                [self.config.training.num_views - 1 - j for j in range(num_target_views)]
-                for _ in range(bs)
-            ], dtype=torch.long, device=data_batch["image"].device)
-            index = torch.sort(index, dim=1).values # [b, num_target_views]
+        num_target_views, num_views, bs = (
+            self.config.training.num_target_views,
+            data_batch["c2w"].size(1),
+            data_batch["image"].size(0),
+        )
+        assert num_target_views < num_views, (
+            f"We have {num_views} views, but we want to select {num_target_views} target views. This is more than the total number of views we have."
+        )
 
+        # Decide the target view indices
+        if target_has_input:
+            # Randomly sample target views across all views
+            index = torch.tensor(
+                [random.sample(range(num_views), num_target_views) for _ in range(bs)],
+                dtype=torch.long,
+                device=data_batch["image"].device,
+            )  # [b, num_target_views]
+        else:
+            assert self.config.training.num_input_views + num_target_views <= self.config.training.num_views, (
+                f"We have {self.config.training.num_views} views in total, but we want to select {self.config.training.num_input_views} input views and {num_target_views} target views. This is more than the total number of views we have."
+            )
+
+            index = torch.tensor(
+                [[self.config.training.num_views - 1 - j for j in range(num_target_views)] for _ in range(bs)],
+                dtype=torch.long,
+                device=data_batch["image"].device,
+            )
+            index = torch.sort(index, dim=1).values  # [b, num_target_views]
 
         for key, value in data_batch.items():
             if key == "scene_name":
                 input_dict[key] = value
                 target_dict[key] = value
                 continue
-            input_dict[key] = value[:, :self.config.training.num_input_views, ...]
+            input_dict[key] = value[:, : self.config.training.num_input_views, ...]
 
-            to_expand_dim = value.shape[2:] # [b, v, (value dim)] -> [value dim], e.g. [c, h, w] or [4] or [4, 4]
-            expanded_index = index.view(index.shape[0], index.shape[1], *(1,) * len(to_expand_dim)).expand(-1, -1, *to_expand_dim)
+            to_expand_dim = value.shape[2:]  # [b, v, (value dim)] -> [value dim], e.g. [c, h, w] or [4] or [4, 4]
+            expanded_index = index.view(index.shape[0], index.shape[1], *(1,) * len(to_expand_dim)).expand(
+                -1, -1, *to_expand_dim
+            )
 
-            # Don't have target image supervision 
-            if key == "image" and not has_target_image:                
+            # Don't have target image supervision
+            if key == "image" and not has_target_image:
                 continue
             else:
+                dim_limit = value.size(1)  # 데이터의 실제 크기 (예: View 개수)
+                max_req_index = expanded_index.max()  # 요청하려는 인덱스 중 가장 큰 값
+
+                if max_req_index >= dim_limit:
+                    print(f"\n========== CRITICAL ERROR DETECTED ==========")
+                    print(f"Error occurred at key: '{key}'")
+                    print(f"1. Tensor Shape (Value): {value.shape}")
+                    print(f"2. Index Shape: {expanded_index.shape}")
+                    print(f"3. Max Index Requested: {max_req_index.item()}")
+                    print(f"4. Available Size (dim=1): {dim_limit}")
+                    print(f"=============================================\n")
+                    # 여기서 강제로 멈춰서 로그를 확인하게 합니다.
+                    raise ValueError(f"Index {max_req_index.item()} is out of bounds for dimension size {dim_limit}")
                 target_dict[key] = torch.gather(value, dim=1, index=expanded_index)
-        
+
         height, width = data_batch["image"].shape[3], data_batch["image"].shape[4]
         input_dict["image_h_w"] = (height, width)
         target_dict["image_h_w"] = (height, width)
@@ -151,8 +171,6 @@ class ProcessData(nn.Module):
 
         return input_dict, target_dict
 
-
-    
     @torch.no_grad()
     def forward(self, data_batch, has_target_image=True, target_has_input=True, compute_rays=True):
         """
@@ -166,7 +184,7 @@ class ProcessData(nn.Module):
             has_target_image (bool): If True, target views have image supervision.
             target_has_input (bool): If True, target views can be sampled from input views.
             compute_rays (bool): If True, compute ray_o and ray_d.
-                
+
         Returns:
             Input and Target data_batch (dict): Contains processed tensors with the following keys:
                 - 'image' (torch.Tensor): Shape [b, v, c, h, w]
@@ -176,18 +194,18 @@ class ProcessData(nn.Module):
                 - 'ray_d' (torch.Tensor): Shape [b, v, 3, h, w]
                 - 'image_h_w' (tuple): (height, width)
         """
-        input_dict, target_dict = self.fetch_views(data_batch, has_target_image=has_target_image, target_has_input=target_has_input)
-
+        input_dict, target_dict = self.fetch_views(
+            data_batch, has_target_image=has_target_image, target_has_input=target_has_input
+        )
         if compute_rays:
             for dict in [input_dict, target_dict]:
                 c2w = dict["c2w"]
                 fxfycxcy = dict["fxfycxcy"]
                 image_height, image_width = dict["image_h_w"]
 
-                ray_o, ray_d = self.compute_rays(c2w, fxfycxcy, image_height, image_width, device=data_batch["image"].device)
+                ray_o, ray_d = self.compute_rays(
+                    c2w, fxfycxcy, image_height, image_width, device=data_batch["image"].device
+                )
                 dict["ray_o"], dict["ray_d"] = ray_o, ray_d
 
         return input_dict, target_dict
-
-      
-      

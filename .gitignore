@@ -135,4 +135,8 @@ dmypy.json
 .pytype/
 
 
-
+# Custom files
+output
+ckpt
+*.ipynb
+raw_data

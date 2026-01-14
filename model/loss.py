@@ -36,11 +36,14 @@ class PerceptualLoss(nn.Module):
         weight_file = Path("./metric_checkpoint/imagenet-vgg-verydeep-19.mat")
         weight_file.parent.mkdir(exist_ok=True, parents=True)
         
-        if torch.distributed.get_rank() == 0:
-            # Download weights if needed
-            if not weight_file.exists():
-                os.system(f'wget https://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat -O {weight_file}')
-        torch.distributed.barrier()
+        # if torch.distributed.get_rank() == 0:
+        #     # Download weights if needed
+        #     if not weight_file.exists():
+        #         os.system(f'wget https://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat -O {weight_file}')
+        # Download weights if needed
+        if not weight_file.exists():
+            os.system(f'wget https://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat -O {weight_file}')
+        # torch.distributed.barrier()
         
         # Load MatConvNet weights
         vgg_data = scipy.io.loadmat(weight_file)
@@ -125,11 +128,12 @@ class LossComputer(nn.Module):
 
         if self.config.training.lpips_loss_weight > 0.0:
             # avoid multiple GPUs from downloading the same LPIPS model multiple times
-            if torch.distributed.get_rank() == 0:
-                self.lpips_loss_module = self._init_frozen_module(lpips.LPIPS(net="vgg"))
-            torch.distributed.barrier()
-            if torch.distributed.get_rank() != 0:
-                self.lpips_loss_module = self._init_frozen_module(lpips.LPIPS(net="vgg"))
+            # if torch.distributed.get_rank() == 0:
+            #     self.lpips_loss_module = self._init_frozen_module(lpips.LPIPS(net="vgg"))
+            # torch.distributed.barrier()
+            # if torch.distributed.get_rank() != 0:
+            #     self.lpips_loss_module = self._init_frozen_module(lpips.LPIPS(net="vgg"))
+            self.lpips_loss_module = self._init_frozen_module(lpips.LPIPS(net="vgg"))
         if self.config.training.perceptual_loss_weight > 0.0:
             self.perceptual_loss_module = self._init_frozen_module(PerceptualLoss())
 
