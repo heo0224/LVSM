@@ -58,8 +58,69 @@ dist.barrier()
 module, class_name = config.model.class_name.rsplit(".", 1)
 LVSM = importlib.import_module(module).__dict__[class_name]
 model = LVSM(config).to(ddp_info.device)
+
+# Check if LoRA inference is enabled
+use_lora = config.training.get("use_lora", False)
+lora_checkpoint = config.inference.get("lora_checkpoint", "")
+
+if use_lora or lora_checkpoint:
+    from model.lora import apply_lora_to_model, load_lora_state_dict, merge_lora_weights, LoRAConfig
+    from utils.training_utils import find_checkpoints
+
+    # Determine checkpoint path
+    ckpt_path = lora_checkpoint if lora_checkpoint else config.training.checkpoint_dir
+    ckpt_paths = find_checkpoints(ckpt_path)
+
+    if ckpt_paths:
+        checkpoint = torch.load(ckpt_paths[-1], map_location="cpu")
+        checkpoint_type = checkpoint.get('checkpoint_type', 'full')
+
+        if checkpoint_type == 'lora_only':
+            # Load base model first if pretrained checkpoint specified
+            pretrained_ckpt = config.training.get("pretrained_checkpoint", "")
+            if pretrained_ckpt:
+                model.load_ckpt(pretrained_ckpt)
+
+            # Create LoRA config from checkpoint or config
+            lora_config_dict = checkpoint.get('lora_config', {})
+            if lora_config_dict:
+                lora_config = LoRAConfig(**lora_config_dict)
+            else:
+                lora_config = LoRAConfig(
+                    rank=config.lora.get("rank", 8),
+                    alpha=config.lora.get("alpha", 16.0),
+                    dropout=config.lora.get("dropout", 0.0),
+                    target_modules=config.lora.get("target_modules", [
+                        "attn.to_qkv", "attn.fc", "mlp.mlp.0", "mlp.mlp.2"
+                    ]),
+                )
+
+            # Apply LoRA structure
+            apply_lora_to_model(model, lora_config, verbose=(ddp_info.local_rank == 0))
+
+            # Load LoRA weights
+            load_lora_state_dict(model, checkpoint['lora_state'])
+            if ddp_info.is_main_process:
+                print(f"Loaded LoRA weights from {ckpt_paths[-1]}")
+
+            # Optionally merge for faster inference
+            if config.inference.get("merge_lora", True):
+                merge_lora_weights(model)
+                if ddp_info.is_main_process:
+                    print("Merged LoRA weights into base model for efficient inference")
+        else:
+            # Full checkpoint with LoRA already merged
+            model.load_state_dict(checkpoint['model'], strict=False)
+            if ddp_info.is_main_process:
+                print(f"Loaded full model from {ckpt_paths[-1]}")
+    else:
+        if ddp_info.is_main_process:
+            print(f"No checkpoint found at {ckpt_path}")
+else:
+    # Standard model loading
+    model.load_ckpt(config.training.checkpoint_dir)
+
 model = DDP(model, device_ids=[ddp_info.local_rank])
-model.module.load_ckpt(config.training.checkpoint_dir)
 
 
 if ddp_info.is_main_process:  

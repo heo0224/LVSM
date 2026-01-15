@@ -11,7 +11,10 @@ from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as dist
 from setup import init_config, init_distributed, init_wandb_and_backup
 from utils.metric_utils import visualize_intermediate_results
-from utils.training_utils import create_optimizer, create_lr_scheduler, auto_resume_job, print_rank0
+from utils.training_utils import (
+    create_optimizer, create_lr_scheduler, auto_resume_job, print_rank0,
+    create_lora_optimizer, save_lora_checkpoint, auto_resume_lora_job
+)
 
 
 # Load config and read(override) arguments from CLI
@@ -71,15 +74,58 @@ total_num_epochs = int(total_param_update_steps * total_batch_size / len(dataset
 module, class_name = config.model.class_name.rsplit(".", 1)
 LVSM = importlib.import_module(module).__dict__[class_name]
 model = LVSM(config).to(ddp_info.device)
+
+# Check if LoRA training is enabled
+use_lora = config.training.get("use_lora", False)
+lora_config = None
+
+if use_lora:
+    from model.lora import apply_lora_to_model, freeze_base_model, LoRAConfig
+
+    # Create LoRA config from settings
+    lora_config = LoRAConfig(
+        rank=config.lora.get("rank", 8),
+        alpha=config.lora.get("alpha", 16.0),
+        dropout=config.lora.get("dropout", 0.0),
+        target_modules=config.lora.get("target_modules", [
+            "attn.to_qkv", "attn.fc", "mlp.mlp.0", "mlp.mlp.2"
+        ]),
+        bias_trainable=config.lora.get("bias_trainable", False),
+        modules_to_save=config.lora.get("modules_to_save", []),
+    )
+
+    # Load pretrained weights first if specified
+    pretrained_ckpt = config.training.get("pretrained_checkpoint", "")
+    if pretrained_ckpt and pretrained_ckpt != "":
+        print_rank0(f"Loading pretrained checkpoint from {pretrained_ckpt}")
+        model.load_ckpt(pretrained_ckpt)
+
+    # Apply LoRA to model
+    print_rank0("Applying LoRA adapters to model...")
+    apply_lora_to_model(model, lora_config, verbose=(ddp_info.local_rank == 0))
+
+    # Freeze base model, keeping only LoRA params trainable
+    freeze_base_model(model, lora_config.modules_to_save)
+    print_rank0("Base model frozen, only LoRA parameters are trainable")
+
+# Wrap with DDP after LoRA is applied
 model = DDP(model, device_ids=[ddp_info.local_rank])
 
-
-optimizer, optimized_param_dict, all_param_dict = create_optimizer(
-    model,
-    config.training.weight_decay,
-    config.training.lr,
-    (config.training.beta1, config.training.beta2),
-)
+# Create optimizer (LoRA or standard)
+if use_lora:
+    optimizer, optimized_param_dict, all_param_dict = create_lora_optimizer(
+        model,
+        config.training.weight_decay,
+        config.training.lr,
+        (config.training.beta1, config.training.beta2),
+    )
+else:
+    optimizer, optimized_param_dict, all_param_dict = create_optimizer(
+        model,
+        config.training.weight_decay,
+        config.training.lr,
+        (config.training.beta1, config.training.beta2),
+    )
 optim_param_list = list(optimized_param_dict.values())
 
 
@@ -97,13 +143,25 @@ if config.training.get("resume_ckpt", "") != "":
 else:
     ckpt_load_path = config.training.checkpoint_dir
 reset_training_state = config.training.get("reset_training_state", False)
-optimizer, lr_scheduler, cur_train_step, cur_param_update_step = auto_resume_job(
-    ckpt_load_path,
-    model,
-    optimizer,
-    lr_scheduler,
-    reset_training_state,
-)
+
+# Resume from checkpoint (LoRA or standard)
+if use_lora:
+    optimizer, lr_scheduler, cur_train_step, cur_param_update_step = auto_resume_lora_job(
+        ckpt_load_path,
+        model,
+        optimizer,
+        lr_scheduler,
+        lora_config,
+        reset_training_state,
+    )
+else:
+    optimizer, lr_scheduler, cur_train_step, cur_param_update_step = auto_resume_job(
+        ckpt_load_path,
+        model,
+        optimizer,
+        lr_scheduler,
+        reset_training_state,
+    )
 
 
 enable_grad_scaler = config.training.use_amp and config.training.amp_dtype == "fp16"
@@ -236,21 +294,42 @@ while cur_train_step <= total_train_steps:
 
         # save checkpoint
         if (cur_train_step % config.training.checkpoint_every == 0) or (cur_train_step == total_train_steps):
-            if isinstance(model, DDP):
-                model_weights = model.module.state_dict()
-            else:
-                model_weights = model.state_dict()
-            checkpoint = {
-                "model": model_weights,
-                "optimizer": optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "fwdbwd_pass_step": cur_train_step,
-                "param_update_step": cur_param_update_step,
-            }
             os.makedirs(config.training.checkpoint_dir, exist_ok=True)
             ckpt_path = os.path.join(config.training.checkpoint_dir, f"ckpt_{cur_train_step:016}.pt")
-            torch.save(checkpoint, ckpt_path)
-            print(f"Saved checkpoint at step {cur_train_step} to {os.path.abspath(ckpt_path)}")
+
+            if use_lora:
+                # LoRA checkpoint saving
+                save_lora_only = config.training.get("save_lora_only", True)
+                save_full_every = config.training.get("save_full_model_every", float('inf'))
+                should_save_full = (cur_train_step % save_full_every == 0) if save_full_every != float('inf') else False
+
+                save_lora_checkpoint(
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    cur_train_step,
+                    cur_param_update_step,
+                    ckpt_path,
+                    lora_config,
+                    save_full_model=should_save_full or not save_lora_only,
+                )
+                ckpt_type = "full" if (should_save_full or not save_lora_only) else "LoRA-only"
+                print(f"Saved {ckpt_type} checkpoint at step {cur_train_step} to {os.path.abspath(ckpt_path)}")
+            else:
+                # Standard checkpoint saving
+                if isinstance(model, DDP):
+                    model_weights = model.module.state_dict()
+                else:
+                    model_weights = model.state_dict()
+                checkpoint = {
+                    "model": model_weights,
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "fwdbwd_pass_step": cur_train_step,
+                    "param_update_step": cur_param_update_step,
+                }
+                torch.save(checkpoint, ckpt_path)
+                print(f"Saved checkpoint at step {cur_train_step} to {os.path.abspath(ckpt_path)}")
         
         # export intermediate visualization results
         if export_inter_results:
