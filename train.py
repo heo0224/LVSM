@@ -107,6 +107,8 @@ if use_lora:
     # Freeze base model, keeping only LoRA params trainable
     freeze_base_model(model, lora_config.modules_to_save)
     print_rank0("Base model frozen, only LoRA parameters are trainable")
+    device = torch.device(f"cuda:{ddp_info.local_rank}")
+    model = model.to(device)
 
 # Wrap with DDP after LoRA is applied
 model = DDP(model, device_ids=[ddp_info.local_rank])
@@ -335,7 +337,9 @@ while cur_train_step <= total_train_steps:
         if export_inter_results:
             vis_path = os.path.join(config.training.checkpoint_dir, f"iter_{cur_train_step:08d}")
             os.makedirs(vis_path, exist_ok=True)
-            visualize_intermediate_results(vis_path, ret_dict)
+            vis_log_dict = visualize_intermediate_results(vis_path, ret_dict)
+            if ddp_info.is_main_process and vis_log_dict:
+                wandb.log(vis_log_dict, step=cur_train_step)
             torch.cuda.empty_cache()
             model.train()
 

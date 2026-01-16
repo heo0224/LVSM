@@ -162,6 +162,7 @@ def visualize_intermediate_results(out_dir, result):
     os.makedirs(out_dir, exist_ok=True)
 
     input, target = result.input, result.target
+    log_dict = {}
 
     if result.render is not None:
         target_image = target.image
@@ -169,6 +170,11 @@ def visualize_intermediate_results(out_dir, result):
         b, v, _, h, w = rendered_image.size()
         rendered_image = rendered_image.reshape(b * v, -1, h, w)
         target_image = target_image.reshape(b * v, -1, h, w)
+
+
+        if target_image.size(1) > rendered_image.size(1):
+            target_image = target_image[:, :rendered_image.size(1), :, :]
+
         visualized_image = torch.cat((target_image, rendered_image), dim=3).detach().cpu()
         visualized_image = rearrange(visualized_image, "(b v) c h (m w) -> (b h) (v m w) c", v=v, m=2)
         visualized_image = (visualized_image.numpy() * 255.0).clip(0.0, 255.0).astype(np.uint8)
@@ -176,12 +182,16 @@ def visualize_intermediate_results(out_dir, result):
         uids = [target.index[b, 0, -1].item() for b in range(target.index.size(0))]
 
         uid_based_filename = f"{uids[0]:08}_{uids[-1]:08}"
-        Image.fromarray(visualized_image).save(
-            os.path.join(out_dir, f"supervision_{uid_based_filename}.jpg")
-        )
+        supervision_path = os.path.join(out_dir, f"supervision_{uid_based_filename}.jpg") # 경로 변수화
+        Image.fromarray(visualized_image).save(supervision_path)
+
         with open(os.path.join(out_dir, f"uids.txt"), "w") as f:
             uids = "_".join([f"{uid:08}" for uid in uids])
             f.write(uids)
+
+        import wandb
+        log_dict["vis/supervision"] = wandb.Image(supervision_path)
+
 
     input_uids = [input.index[b, 0, -1].item() for b in range(input.index.size(0))]
     input_uid_based_filename = f"{input_uids[0]:08}_{input_uids[-1]:08}"
@@ -189,26 +199,43 @@ def visualize_intermediate_results(out_dir, result):
     # Create a grid of input images
     b, v, c, h, w = input.image.size()
     input_images = input.image.reshape(b * v, c, h, w).detach().cpu()
+
+    # 여기도 수정
+    if c == 4:
+        input_images = input_images[:, :3, :, :]
+        c = 3
+
     input_grid = rearrange(input_images, "(b v) c h w -> (b h) (v w) c", v=v)
     input_grid = (input_grid.numpy() * 255.0).clip(0.0, 255.0).astype(np.uint8)
     
     # Save the input image grid
-    Image.fromarray(input_grid).save(
-        os.path.join(out_dir, f"input_{input_uid_based_filename}.jpg")
-    )
+    input_path = os.path.join(out_dir, f"input_{input_uid_based_filename}.jpg") # 경로 변수화
+    Image.fromarray(input_grid).save(input_path)
 
+    import wandb
+    log_dict["vis/input_images"] = wandb.Image(input_path)
+    
+    return log_dict
 
 def _save_images(result, batch_idx, out_dir):
     """Save visualization images."""
     # Save input image
     input_img = result.input.image[batch_idx]
+    
+    if input_img.shape[1] == 4:
+        input_img = input_img[:, :3, :, :]
+        
     input_img = rearrange(input_img, "v c h w -> h (v w) c")
     input_img = (input_img.cpu().numpy() * 255.0).clip(0.0, 255.0).astype(np.uint8)
     Image.fromarray(input_img).save(os.path.join(out_dir, "input.png"))
 
+    target_img = result.target.image[batch_idx]
+    if target_img.shape[1] == 4:  # [View, Channel, H, W] 이므로 인덱스 1이 채널
+        target_img = target_img[:, :3, :, :]
+
     # Save GT vs prediction side-by-side
     comparison = torch.cat(
-        (result.target.image[batch_idx], result.render[batch_idx]), 
+        (target_img, result.render[batch_idx]), 
         dim=2
     ).detach().cpu()
     comparison = rearrange(comparison, "v c h w -> h (v w) c")
@@ -219,10 +246,17 @@ def _save_images(result, batch_idx, out_dir):
 def _save_metrics(target, prediction, view_indices, out_dir, scene_name):
     target = target.to(torch.float32)
     prediction = prediction.to(torch.float32)
+
+    if target.shape[1] == 4:
+        target = target[:, :3, :, :]
     
     psnr_values = compute_psnr(target, prediction)
     lpips_values = compute_lpips(target, prediction)
     ssim_values = compute_ssim(target, prediction)
+    
+    if psnr_values.ndim == 0: psnr_values = psnr_values.unsqueeze(0)
+    if lpips_values.ndim == 0: lpips_values = lpips_values.unsqueeze(0)
+    if ssim_values.ndim == 0: ssim_values = ssim_values.unsqueeze(0)
 
     metrics = {
         "summary": {

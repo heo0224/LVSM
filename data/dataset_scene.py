@@ -137,6 +137,8 @@ class Dataset(Dataset):
         view_selector_config = self.config.training.view_selector
         min_frame_dist = view_selector_config.get("min_frame_dist", 25)
         max_frame_dist = min(len(frames) - 1, view_selector_config.get("max_frame_dist", 100))
+        balanced_agent_wrist = view_selector_config.get("balanced_agent_wrist", False)
+
         if max_frame_dist <= min_frame_dist:
             return None
         frame_dist = random.randint(min_frame_dist, max_frame_dist)
@@ -144,8 +146,33 @@ class Dataset(Dataset):
             return None
         start_frame = random.randint(0, len(frames) - frame_dist - 1)
         end_frame = start_frame + frame_dist
-        sampled_frames = random.sample(range(start_frame + 1, end_frame), self.config.training.num_views-2)
-        image_indices = [start_frame, end_frame] + sampled_frames
+
+        if balanced_agent_wrist:
+            # Ensure input views include 1 agent view (even index) and 1 wrist view (odd index)
+            agent_indices = [i for i in range(start_frame, end_frame + 1) if i % 2 == 0]
+            wrist_indices = [i for i in range(start_frame, end_frame + 1) if i % 2 == 1]
+
+            if len(agent_indices) < 1 or len(wrist_indices) < 1:
+                return None
+
+            # Select 1 agent and 1 wrist for input views
+            selected_agent = random.choice(agent_indices)
+            selected_wrist = random.choice(wrist_indices)
+
+            # Remaining views for targets
+            remaining = [i for i in range(start_frame, end_frame + 1)
+                         if i != selected_agent and i != selected_wrist]
+
+            if len(remaining) < self.config.training.num_views - 2:
+                return None
+
+            sampled_targets = random.sample(remaining, self.config.training.num_views - 2)
+            image_indices = [selected_agent, selected_wrist] + sampled_targets
+        else:
+            # Original behavior
+            sampled_frames = random.sample(range(start_frame + 1, end_frame), self.config.training.num_views - 2)
+            image_indices = [start_frame, end_frame] + sampled_frames
+
         return image_indices
 
     def __getitem__(self, idx):
